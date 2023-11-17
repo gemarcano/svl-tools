@@ -1,0 +1,16 @@
+[package]
+name = "artemis_flash_utils-rs"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.5.0"
+clap = { version = "4.4.8", features = ["derive"] }
+clap-verbosity-flag = "2.1.0"
+crc = "3.0.1"
+env_logger = "0.10.1"
+log = "0.4.20"
+serialport = "4.2.2"
