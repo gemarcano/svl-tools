@@ -1,13 +1,17 @@
-use byteorder::BigEndian;
-use byteorder::ReadBytesExt;
-use byteorder::WriteBytesExt;
+mod svl;
+use svl::Command;
+use svl::Error;
+use svl::Packet;
+use svl::Result;
+use svl::Svl;
+
 use clap::Parser;
-use crc::{Crc, CRC_16_UMTS};
 use log::{debug, error, info};
 use serialport::SerialPort;
+use indicatif::{ProgressBar, ProgressStyle};
+
 use std::cmp;
 use std::fs::File;
-use std::io;
 use std::io::Read;
 use std::num;
 use std::path::Path;
@@ -16,150 +20,7 @@ use std::result;
 use std::time;
 use std::time::Duration;
 use std::time::Instant;
-
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-
-// SVL uses CRC16 UMTS
-
-#[derive(Parser)]
-#[command(author, version, about, long_about=None)]
-struct Cli {
-    port: PathBuf,
-    #[arg(short, long, default_value_t = 115200)]
-    baud: u32,
-    #[arg(short = 'f', long)]
-    binfile: PathBuf,
-    #[command(flatten)]
-    verbose: clap_verbosity_flag::Verbosity,
-    #[arg(short, long, value_parser=parse_duration, default_value="500")]
-    timeout: Duration,
-}
-
-fn parse_duration(arg: &str) -> result::Result<Duration, num::ParseIntError> {
-    let milliseconds = arg.parse()?;
-    Ok(std::time::Duration::from_millis(milliseconds))
-}
-
-struct Packet {
-    command: Command,
-    data: Vec<u8>,
-}
-
-trait Svl: ReadBytesExt + WriteBytesExt
-{
-    fn get_packet(&mut self) -> Result<Packet> {
-        // Packet consists of:
-        // 2 bytes as length (big endian)
-        // 1 byte as command
-        // [0 - N] bytes as payload
-        // 2 bytes as CRC (big endian)
-        //
-        // Minimum packet size is 3, as length bytes don't count towards packet size.
-
-        let len = self.read_u16::<BigEndian>()?;
-        debug!("Received a packet len: {}", len);
-        if len < 3 {
-            return Err(Error::InvalidPacket("Packet length is too short".to_string()));
-        }
-
-        // Payload consists of command, data and CRC
-        let mut payload = vec![0u8; len.into()];
-        self.read_exact(&mut payload)?;
-
-        // If CRC is correct, calculating the CRC over the entire payload, CRC16 inclusive, should
-        // yield 0.
-        let crc = Crc::<u16>::new(&CRC_16_UMTS);
-        let mut digest = crc.digest();
-        digest.update(&payload);
-        if digest.finalize() != 0 {
-            return Err(Error::InvalidPacket("CRC failed".to_string()));
-        }
-
-        debug!("Command received: {}", payload[0]);
-        debug!("Data length: {}", (len - 2) - 1);
-        let result = Packet {
-            command: payload[0].try_into()?,
-            data: payload[1..(len - 2).into()].to_vec(),
-        };
-        Ok(result)
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if packet.data.len() > (u16::MAX - 3).into() {
-            return Err(Error::InvalidPacket("Too much data in packet".to_string()));
-        }
-
-        let len: u16 = (packet.data.len() + 3) as u16;
-        let cmd: u8 = packet.command.into();
-        let crc = Crc::<u16>::new(&CRC_16_UMTS);
-        let mut digest = crc.digest();
-        digest.update(&[cmd]);
-        digest.update(&packet.data);
-        let crc = digest.finalize();
-
-        debug!("Sending len: {}, cmd: {}, crc: 0x{:04X}", len, cmd, crc);
-        self.write_u16::<BigEndian>(len)?;
-        self.write_u8(cmd)?;
-        self.write_all(&packet.data)?;
-        self.write_u16::<BigEndian>(crc)?;
-
-        Ok(())
-    }
-}
-
-impl<T: ReadBytesExt + WriteBytesExt + ?Sized> Svl for T {}
-
-#[derive(Copy, Clone)]
-enum Command {
-    Version = 1,
-    Bootload,
-    Next,
-    Frame,
-    Retry,
-    Done,
-}
-
-impl From<Command> for u8 {
-    fn from(command: Command) -> Self {
-        command as u8
-    }
-}
-
-impl TryFrom<u8> for Command {
-    type Error = Error;
-    fn try_from(num: u8) -> result::Result<Self, Self::Error> {
-        match num {
-            1 => Ok(Command::Version),
-            2 => Ok(Command::Bootload),
-            3 => Ok(Command::Next),
-            4 => Ok(Command::Frame),
-            5 => Ok(Command::Retry),
-            6 => Ok(Command::Done),
-            _ => Err(Error::InvalidPacket("Unknown command".to_string())),
-        }
-    }
-}
-
-type Result<T> = result::Result<T, Error>;
-
-enum Error {
-    Serial(serialport::Error),
-    Io(io::Error),
-    InvalidPacket(String),
-    BootloadError(String),
-}
-
-impl From<serialport::Error> for Error {
-    fn from(err: serialport::Error) -> Error {
-        Error::Serial(err)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Error {
-        Error::Io(err)
-    }
-}
+use std::fs;
 
 fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     info!("Phase: Setup");
@@ -181,12 +42,10 @@ fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     println!("Got SVL Bootloader Version: {}", packet.data[0]);
     info!("Sending 'enter bootloader' command");
 
-    serial.send_packet(
-        &Packet {
-            command: Command::Bootload,
-            data: vec![],
-        },
-    )?;
+    serial.send_packet(&Packet {
+        command: Command::Bootload,
+        data: vec![],
+    })?;
 
     Ok(())
 }
@@ -195,7 +54,8 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
     info!("Phase: Bootload");
 
     let start_time = Instant::now();
-    // FIXME why this frame size
+    // The frame size is determined by the size of the receive buffer on the device, which is 2048
+    // currently
     let frame_size: usize = 512 * 4;
 
     let resend_max = 4;
@@ -203,16 +63,22 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
 
     let mut binary = File::open(bin_path)?;
     let mut binary_data = vec![];
+
+    //FIXME should we first read the size of the data, and make a determination about whether it is
+    //OK to send?
+    let total_length = fs::metadata(bin_path)?.len() as usize;
+    // FIXME why not iterate on the data?
     binary.read_to_end(&mut binary_data)?;
 
-    let total_length = binary_data.len();
+    assert!(total_length == binary_data.len());
     let total_frames = ((total_length as f64) / (frame_size as f64)).ceil() + 0.5;
     let total_frames = total_frames as usize;
 
     let mut current_frame: usize = 0;
 
     let progress_bar = ProgressBar::new(total_frames as u64);
-    progress_bar.set_style(ProgressStyle::with_template("{bar:^20.red/white.bold} {percent:>3}%").unwrap());
+    progress_bar
+        .set_style(ProgressStyle::with_template("{bar:^20.red/white.bold} {percent:>3}%").unwrap());
     progress_bar.tick();
 
     info!(
@@ -265,19 +131,15 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
 
             progress_bar.set_position(current_frame as u64);
 
-            serial.send_packet(
-                &Packet {
-                    command: Command::Frame,
-                    data: frame_data.to_vec(),
-                },
-            )?;
+            serial.send_packet(&Packet {
+                command: Command::Frame,
+                data: frame_data.to_vec(),
+            })?;
         } else {
-            serial.send_packet(
-                &Packet {
-                    command: Command::Done,
-                    data: vec![],
-                },
-            )?;
+            serial.send_packet(&Packet {
+                command: Command::Done,
+                data: vec![],
+            })?;
             bootloader_done = true;
         }
     }
@@ -287,6 +149,25 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
     println!("Nominal bootload bps: {}", bits_per_second);
 
     Ok(())
+}
+
+#[derive(Parser)]
+#[command(author, version, about, long_about=None)]
+struct Cli {
+    port: PathBuf,
+    #[arg(short, long, default_value_t = 115200)]
+    baud: u32,
+    #[arg(short = 'f', long)]
+    binfile: PathBuf,
+    #[command(flatten)]
+    verbose: clap_verbosity_flag::Verbosity,
+    #[arg(short, long, value_parser=parse_duration, default_value="500")]
+    timeout: Duration,
+}
+
+fn parse_duration(arg: &str) -> result::Result<Duration, num::ParseIntError> {
+    let milliseconds = arg.parse()?;
+    Ok(std::time::Duration::from_millis(milliseconds))
 }
 
 fn main() {
@@ -325,6 +206,8 @@ fn main() {
 
         // Startup time for Artemis bootloader (experimentally determined - 0.095 sec min delay)
         std::thread::sleep(time::Duration::from_millis(150));
+
+        // Pre-check-- make sure the binfile exists, and that its size is reasonable
 
         if phase_setup(&mut *serial).is_ok() {
             entered_bootloader = true;
