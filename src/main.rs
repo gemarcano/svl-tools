@@ -17,6 +17,8 @@ use std::time;
 use std::time::Duration;
 use std::time::Instant;
 
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
+
 // SVL uses CRC16 UMTS
 
 #[derive(Parser)]
@@ -42,6 +44,70 @@ struct Packet {
     command: Command,
     data: Vec<u8>,
 }
+
+trait Svl: ReadBytesExt + WriteBytesExt
+{
+    fn get_packet(&mut self) -> Result<Packet> {
+        // Packet consists of:
+        // 2 bytes as length (big endian)
+        // 1 byte as command
+        // [0 - N] bytes as payload
+        // 2 bytes as CRC (big endian)
+        //
+        // Minimum packet size is 3, as length bytes don't count towards packet size.
+
+        let len = self.read_u16::<BigEndian>()?;
+        debug!("Received a packet len: {}", len);
+        if len < 3 {
+            return Err(Error::InvalidPacket("Packet length is too short".to_string()));
+        }
+
+        // Payload consists of command, data and CRC
+        let mut payload = vec![0u8; len.into()];
+        self.read_exact(&mut payload)?;
+
+        // If CRC is correct, calculating the CRC over the entire payload, CRC16 inclusive, should
+        // yield 0.
+        let crc = Crc::<u16>::new(&CRC_16_UMTS);
+        let mut digest = crc.digest();
+        digest.update(&payload);
+        if digest.finalize() != 0 {
+            return Err(Error::InvalidPacket("CRC failed".to_string()));
+        }
+
+        debug!("Command received: {}", payload[0]);
+        debug!("Data length: {}", (len - 2) - 1);
+        let result = Packet {
+            command: payload[0].try_into()?,
+            data: payload[1..(len - 2).into()].to_vec(),
+        };
+        Ok(result)
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if packet.data.len() > (u16::MAX - 3).into() {
+            return Err(Error::InvalidPacket("Too much data in packet".to_string()));
+        }
+
+        let len: u16 = (packet.data.len() + 3) as u16;
+        let cmd: u8 = packet.command.into();
+        let crc = Crc::<u16>::new(&CRC_16_UMTS);
+        let mut digest = crc.digest();
+        digest.update(&[cmd]);
+        digest.update(&packet.data);
+        let crc = digest.finalize();
+
+        debug!("Sending len: {}, cmd: {}, crc: 0x{:04X}", len, cmd, crc);
+        self.write_u16::<BigEndian>(len)?;
+        self.write_u8(cmd)?;
+        self.write_all(&packet.data)?;
+        self.write_u16::<BigEndian>(crc)?;
+
+        Ok(())
+    }
+}
+
+impl<T: ReadBytesExt + WriteBytesExt + ?Sized> Svl for T {}
 
 #[derive(Copy, Clone)]
 enum Command {
@@ -95,84 +161,27 @@ impl From<io::Error> for Error {
     }
 }
 
-fn wait_for_packet(serial: &mut (impl SerialPort + ?Sized)) -> Result<Packet> {
-    // Packet consists of:
-    // 2 bytes as length (big endian)
-    // 1 byte as command
-    // [0 - N] bytes as payload
-    // 2 bytes as CRC (big endian)
-    //
-    // Minimum packet size is 3, as length bytes don't count towards packet size.
-
-    let len = serial.read_u16::<BigEndian>()?;
-    debug!("Received a packet len: {}", len);
-    if len < 3 {
-        return Err(Error::InvalidPacket("Packet length is too short".to_string()));
-    }
-
-    // Payload consists of command, data and CRC
-    let mut payload = vec![0u8; len.into()];
-    serial.read_exact(&mut payload)?;
-
-    // If CRC is correct, calculating the CRC over the entire payload, CRC16 inclusive, should
-    // yield 0.
-    let crc = Crc::<u16>::new(&CRC_16_UMTS);
-    let mut digest = crc.digest();
-    digest.update(&payload);
-    if digest.finalize() != 0 {
-        return Err(Error::InvalidPacket("CRC failed".to_string()));
-    }
-
-    debug!("Command received: {}", payload[0]);
-    debug!("Data length: {}", (len - 2) - 1);
-    let result = Packet {
-        command: payload[0].try_into()?,
-        data: payload[1..(len - 2).into()].to_vec(),
-    };
-    Ok(result)
-}
-
-fn send_packet(serial: &mut (impl SerialPort + ?Sized), packet: &Packet) -> Result<()> {
-    if packet.data.len() > (u16::MAX - 3).into() {
-        return Err(Error::InvalidPacket("Too much data in packet".to_string()));
-    }
-
-    let len: u16 = (packet.data.len() + 3) as u16;
-    let cmd: u8 = packet.command.into();
-    let crc = Crc::<u16>::new(&CRC_16_UMTS);
-    let mut digest = crc.digest();
-    digest.update(&[cmd]);
-    digest.update(&packet.data);
-    let crc = digest.finalize();
-
-    debug!("Sending len: {}, cmd: {}, crc: 0x{:04X}", len, cmd, crc);
-    serial.write_u16::<BigEndian>(len)?;
-    serial.write_u8(cmd)?;
-    serial.write_all(&packet.data)?;
-    serial.write_u16::<BigEndian>(crc)?;
-
-    Ok(())
-}
-
-fn phase_setup(serial: &mut (impl SerialPort + ?Sized)) -> Result<()> {
+fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     info!("Phase: Setup");
 
     // Handle the serial startup blip
     // Gabe: From what I can tell, supposedly according to the SVL bootloader source code, there's
     // apparently a 23 microsecond blip in the TX line that might be interpreted as data when the
     // bootloader enables its uart interface. This just makes sure to ditch that data.
+    // FIXME why is this before the baud detection? Is it because the UART TX line is inactive at
+    // first during bootrom, and is either floating or... something? UART hardware isn't connected
+    // until after baud detection.
     serial.clear(serialport::ClearBuffer::Input)?;
     info!("Cleared the startup blip");
 
     // Send the baud detection character, it's 0b10101010
     serial.write_u8(b'U')?;
-    let packet = wait_for_packet(serial)?;
+    let packet = serial.get_packet()?;
 
     println!("Got SVL Bootloader Version: {}", packet.data[0]);
     info!("Sending 'enter bootloader' command");
 
-    send_packet(
-        serial,
+    serial.send_packet(
         &Packet {
             command: Command::Bootload,
             data: vec![],
@@ -182,7 +191,9 @@ fn phase_setup(serial: &mut (impl SerialPort + ?Sized)) -> Result<()> {
     Ok(())
 }
 
-fn phase_bootload(serial: &mut (impl SerialPort + ?Sized), bin_path: &Path) -> Result<()> {
+fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<()> {
+    info!("Phase: Bootload");
+
     let start_time = Instant::now();
     // FIXME why this frame size
     let frame_size: usize = 512 * 4;
@@ -190,7 +201,6 @@ fn phase_bootload(serial: &mut (impl SerialPort + ?Sized), bin_path: &Path) -> R
     let resend_max = 4;
     let mut resend_count = 0;
 
-    info!("Phase: Bootload");
     let mut binary = File::open(bin_path)?;
     let mut binary_data = vec![];
     binary.read_to_end(&mut binary_data)?;
@@ -200,7 +210,10 @@ fn phase_bootload(serial: &mut (impl SerialPort + ?Sized), bin_path: &Path) -> R
     let total_frames = total_frames as usize;
 
     let mut current_frame: usize = 0;
-    let mut progress_chars = 0;
+
+    let progress_bar = ProgressBar::new(total_frames as u64);
+    progress_bar.set_style(ProgressStyle::with_template("{bar:^20.red/white.bold} {percent:>3}%").unwrap());
+    progress_bar.tick();
 
     info!(
         "have {} bytes to send in {} frames",
@@ -210,7 +223,7 @@ fn phase_bootload(serial: &mut (impl SerialPort + ?Sized), bin_path: &Path) -> R
     let mut bootloader_done = false;
 
     while !bootloader_done {
-        let packet = wait_for_packet(serial)?;
+        let packet = serial.get_packet()?;
         match packet.command {
             Command::Next => {
                 current_frame += 1;
@@ -250,19 +263,16 @@ fn phase_bootload(serial: &mut (impl SerialPort + ?Sized), bin_path: &Path) -> R
                 frame_data.len()
             );
 
-            // FIXME some kind of percent bar goes here
-            let percent_complete = current_frame * 100 / total_frames;
+            progress_bar.set_position(current_frame as u64);
 
-            send_packet(
-                serial,
+            serial.send_packet(
                 &Packet {
                     command: Command::Frame,
                     data: frame_data.to_vec(),
                 },
             )?;
         } else {
-            send_packet(
-                serial,
+            serial.send_packet(
                 &Packet {
                     command: Command::Done,
                     data: vec![],
