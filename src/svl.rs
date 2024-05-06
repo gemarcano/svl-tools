@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Frame,
     Retry,
     Done,
+    Read = 100,
+    ReadResponse,
 }
 
 impl From<Command> for u8 {
@@ -56,6 +58,8 @@ impl TryFrom<u8> for Command {
             4 => Ok(Command::Frame),
             5 => Ok(Command::Retry),
             6 => Ok(Command::Done),
+            100 => Ok(Command::Read),
+            101 => Ok(Command::ReadResponse),
             _ => Err(Error::InvalidPacket("Unknown command".to_string())),
         }
     }

@@ -6,11 +6,12 @@ use svl::Result;
 use svl::Svl;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info};
 use serialport::SerialPort;
-use indicatif::{ProgressBar, ProgressStyle};
 
 use std::cmp;
+use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::num;
@@ -20,7 +21,6 @@ use std::result;
 use std::time;
 use std::time::Duration;
 use std::time::Instant;
-use std::fs;
 
 fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     info!("Phase: Setup");
@@ -38,14 +38,82 @@ fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     // Send the baud detection character, it's 0b10101010
     serial.write_u8(b'U')?;
     let packet = serial.get_packet()?;
-
     println!("Got SVL Bootloader Version: {}", packet.data[0]);
+
+    Ok(())
+}
+
+fn enter_bootload(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     info!("Sending 'enter bootloader' command");
 
     serial.send_packet(&Packet {
         command: Command::Bootload,
         data: vec![],
     })?;
+
+    Ok(())
+}
+
+fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u32) -> Result<()> {
+    info!("Sending 'read' command");
+
+    let mut payload = vec![];
+    payload.extend_from_slice(&address.to_be_bytes());
+    payload.extend_from_slice(&size.to_be_bytes());
+    serial.send_packet(&Packet {
+        command: Command::Read,
+        data: payload,
+    })?;
+
+    Ok(())
+}
+
+fn phase_read(serial: &mut (impl Svl + ?Sized)) -> Result<()> {
+    info!("Phase: Read");
+
+    // The frame size is determined by the size of the receive buffer on the device, which is 2048
+    // currently
+    let resend_max = 4;
+    let mut resend_count = 0;
+
+    let mut read_done = false;
+
+    let mut read_response = vec![];
+    while !read_done {
+        let packet = serial.get_packet()?;
+        match packet.command {
+            Command::Next | Command::Retry => {
+                if let Command::Retry = packet.command {
+                    if resend_count >= resend_max {
+                        return Err(Error::BootloadError("Too many retries...".to_string()));
+                    }
+                    resend_count += 1;
+                    info!("Retrying...");
+                }
+                if request_read(&mut *serial, 0x10000, 64).is_err() {
+                    error!("Failed to request read");
+                }
+            }
+            Command::ReadResponse => {
+                if packet.data.len() < 4 && (packet.data.len() % 4) != 0 {
+                    return Err(Error::InvalidPacket(
+                        "Wrong number of bytes in payload".to_string(),
+                    ));
+                }
+                read_response = packet.data;
+                read_done = true;
+            }
+            _ => {
+                return Err(Error::BootloadError("Timeout or unknown error".to_string()));
+            }
+        }
+    }
+
+    print!("Read complete: ");
+    for byte in &read_response {
+        print!("{byte:#04X} ");
+    }
+    println!("");
 
     Ok(())
 }
@@ -208,9 +276,28 @@ fn main() {
         std::thread::sleep(time::Duration::from_millis(150));
 
         // Pre-check-- make sure the binfile exists, and that its size is reasonable
+        if phase_setup(&mut *serial).is_err() {
+            error!("Failed to setup connection");
+        }
 
-        if phase_setup(&mut *serial).is_ok() {
+        if enter_bootload(&mut *serial).is_ok() {
             entered_bootloader = true;
+
+            let result = phase_read(&mut *serial);
+            match result {
+                Ok(()) => {}
+                Err(error) => {
+                    match error {
+                        Error::InvalidPacket(error) => println!("{}", error),
+                        Error::BootloadError(error) => println!("{}", error),
+                        Error::Io(error) => println!("{}", error),
+                        Error::Serial(error) => println!("{}", error),
+                    }
+                    println!("Read failed");
+                    return;
+                }
+            }
+
             let result = phase_bootload(&mut *serial, &cli.binfile);
             match result {
                 Ok(()) => break,
