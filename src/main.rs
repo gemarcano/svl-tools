@@ -130,7 +130,7 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
     let start_time = Instant::now();
     // The frame size is determined by the size of the receive buffer on the device, which is 2048
     // currently
-    let frame_size: usize = 512 * 4;
+    let frame_size: usize = 512 * 4 * 4;
 
     let resend_max = 4;
     let mut resend_count = 0;
