@@ -5,6 +5,7 @@ use svl::Packet;
 use svl::Result;
 use svl::Svl;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info};
@@ -113,7 +114,7 @@ fn phase_read(serial: &mut (impl Svl + ?Sized)) -> Result<()> {
     for byte in &read_response {
         print!("{byte:#04X} ");
     }
-    println!("");
+    println!();
 
     Ok(())
 }
@@ -219,17 +220,31 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
     Ok(())
 }
 
+fn parse_baud(arg: String) -> u32 {
+    arg.parse::<u32>().unwrap()
+}
+
+const BAUD_OPTIONS: [&'static str; 5] = ["921600", "460800", "230400", "115200", "57600"];
+
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
 struct Cli {
+    /// Path to the serial device connected to the Sparkfun Variable Loader.
     port: PathBuf,
-    #[arg(short, long, default_value_t = 115200)]
+    #[arg(
+        short,
+        long,
+        value_parser = PossibleValuesParser::new(BAUD_OPTIONS).map(parse_baud),
+        default_value_t = 921600)]
+    /// The baud rate to connect to the bootloader with.
     baud: u32,
     #[arg(short = 'f', long)]
+    /// The binary file to upload to the bootloader.
     binfile: PathBuf,
     #[command(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
     #[arg(short, long, value_parser=parse_duration, default_value="500")]
+    /// Serial communication timeout in milliseconds.
     timeout: Duration,
 }
 
