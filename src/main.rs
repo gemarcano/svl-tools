@@ -6,7 +6,7 @@ use svl::Result;
 use svl::Svl;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info};
 use serialport::SerialPort;
@@ -115,6 +115,11 @@ fn phase_read(serial: &mut (impl Svl + ?Sized)) -> Result<()> {
         print!("{byte:#04X} ");
     }
     println!();
+    // Tell bootloader we're done...
+    serial.send_packet(&Packet {
+        command: Command::Done,
+        data: vec![],
+    })?;
 
     Ok(())
 }
@@ -224,11 +229,32 @@ fn parse_baud(arg: String) -> u32 {
     arg.parse::<u32>().unwrap()
 }
 
-const BAUD_OPTIONS: [&'static str; 5] = ["921600", "460800", "230400", "115200", "57600"];
+const BAUD_OPTIONS: [&str; 5] = ["921600", "460800", "230400", "115200", "57600"];
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Flash an application through the SVL.
+    Flash {
+        #[arg(short = 'f', long)]
+        /// The binary file to upload to the bootloader.
+        binfile: PathBuf,
+    },
+    /// Read memory by querying the SVL.
+    Read {
+        #[arg(value_parser = parse_maybe_hex)]
+        /// The starting address to read from.
+        address: u32,
+        #[arg(value_parser = parse_maybe_hex)]
+        /// The number of bytes to read.
+        size: u32,
+    },
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
+#[command(propagate_version = true)]
 struct Cli {
+    #[arg(short, long)]
     /// Path to the serial device connected to the Sparkfun Variable Loader.
     port: PathBuf,
     #[arg(
@@ -238,9 +264,8 @@ struct Cli {
         default_value_t = 921600)]
     /// The baud rate to connect to the bootloader with.
     baud: u32,
-    #[arg(short = 'f', long)]
-    /// The binary file to upload to the bootloader.
-    binfile: PathBuf,
+    #[command(subcommand)]
+    command: Commands,
     #[command(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
     #[arg(short, long, value_parser=parse_duration, default_value="500")]
@@ -251,6 +276,14 @@ struct Cli {
 fn parse_duration(arg: &str) -> result::Result<Duration, num::ParseIntError> {
     let milliseconds = arg.parse()?;
     Ok(std::time::Duration::from_millis(milliseconds))
+}
+
+fn parse_maybe_hex(arg: &str) -> result::Result<u32, num::ParseIntError> {
+    if let Some(s) = arg.strip_prefix("0x") {
+        u32::from_str_radix(s, 16)
+    } else {
+        arg.parse::<u32>()
+    }
 }
 
 fn main() {
@@ -267,23 +300,19 @@ fn main() {
         env!("CARGO_PKG_VERSION_MINOR")
     );
 
-    if !cli.binfile.exists() {
-        error!("Bin file {} does not exist.", cli.binfile.display());
-        return;
-    }
     // FIXME what about tty?
 
-    let num_tries = 3;
+    const NUM_TRIES: i32 = 3;
 
     let mut entered_bootloader = false;
 
-    for _ in 0..num_tries {
+    for _ in 0..NUM_TRIES {
         let serial = serialport::new(cli.port.to_string_lossy(), cli.baud)
             .timeout(cli.timeout)
             .open();
         if serial.is_err() {
             error!("Unable to open serial port {}.", cli.port.display());
-            return;
+            continue;
         }
         let mut serial = serial.unwrap();
 
@@ -295,42 +324,55 @@ fn main() {
             error!("Failed to setup connection");
         }
 
+        // Send bootloader command and check for a NEXT reply...
         if enter_bootload(&mut *serial).is_ok() {
             entered_bootloader = true;
 
-            let result = phase_read(&mut *serial);
-            match result {
-                Ok(()) => {}
-                Err(error) => {
-                    match error {
-                        Error::InvalidPacket(error) => println!("{}", error),
-                        Error::BootloadError(error) => println!("{}", error),
-                        Error::Io(error) => println!("{}", error),
-                        Error::Serial(error) => println!("{}", error),
+            match &cli.command {
+                Commands::Flash { binfile } => {
+                    if !binfile.exists() {
+                        error!("Bin file {} does not exist.", binfile.display());
+                        return;
                     }
-                    println!("Read failed");
-                    return;
+                    let result = phase_bootload(&mut *serial, binfile);
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            match error {
+                                Error::InvalidPacket(error) => println!("{}", error),
+                                Error::BootloadError(error) => println!("{}", error),
+                                Error::Io(error) => println!("{}", error),
+                                Error::Serial(error) => println!("{}", error),
+                            }
+                            println!("Upload failed");
+                            continue;
+                        }
+                    }
+                }
+                Commands::Read { address, size } => {
+                    println!("A: {address:#X}, S: {size}");
+                    let result = phase_read(&mut *serial);
+                    match result {
+                        Ok(()) => {}
+                        Err(error) => {
+                            match error {
+                                Error::InvalidPacket(error) => println!("{}", error),
+                                Error::BootloadError(error) => println!("{}", error),
+                                Error::Io(error) => println!("{}", error),
+                                Error::Serial(error) => println!("{}", error),
+                            }
+                            println!("Read failed");
+                            continue;
+                        }
+                    }
                 }
             }
-
-            let result = phase_bootload(&mut *serial, &cli.binfile);
-            match result {
-                Ok(()) => break,
-                Err(error) => {
-                    match error {
-                        Error::InvalidPacket(error) => println!("{}", error),
-                        Error::BootloadError(error) => println!("{}", error),
-                        Error::Io(error) => println!("{}", error),
-                        Error::Serial(error) => println!("{}", error),
-                    }
-                    println!("Upload failed");
-                }
-            }
+            // If we got here, we didn't hit an error, so break out...
+            break;
         } else {
             error!("Failed to enter bootload phase");
         }
     }
-
     if !entered_bootloader {
         println!("Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader.");
     }
