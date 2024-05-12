@@ -55,7 +55,7 @@ fn enter_bootload(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     Ok(())
 }
 
-fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u32) -> Result<()> {
+fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Result<()> {
     info!("Sending 'read' command");
 
     let mut payload = vec![];
@@ -69,7 +69,7 @@ fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u32) -> Re
     Ok(())
 }
 
-fn phase_read(serial: &mut (impl Svl + ?Sized)) -> Result<()> {
+fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Result<()> {
     info!("Phase: Read");
 
     // The frame size is determined by the size of the receive buffer on the device, which is 2048
@@ -91,7 +91,7 @@ fn phase_read(serial: &mut (impl Svl + ?Sized)) -> Result<()> {
                     resend_count += 1;
                     info!("Retrying...");
                 }
-                if request_read(&mut *serial, 0x10000, 64).is_err() {
+                if request_read(&mut *serial, address, size).is_err() {
                     error!("Failed to request read");
                 }
             }
@@ -244,9 +244,9 @@ enum Commands {
         #[arg(value_parser = parse_maybe_hex)]
         /// The starting address to read from.
         address: u32,
-        #[arg(value_parser = parse_maybe_hex)]
+        #[arg(value_parser = parse_maybe_hex16)]
         /// The number of bytes to read.
-        size: u32,
+        size: u16,
     },
 }
 
@@ -283,6 +283,14 @@ fn parse_maybe_hex(arg: &str) -> result::Result<u32, num::ParseIntError> {
         u32::from_str_radix(s, 16)
     } else {
         arg.parse::<u32>()
+    }
+}
+
+fn parse_maybe_hex16(arg: &str) -> result::Result<u16, num::ParseIntError> {
+    if let Some(s) = arg.strip_prefix("0x") {
+        u16::from_str_radix(s, 16)
+    } else {
+        arg.parse::<u16>()
     }
 }
 
@@ -351,7 +359,7 @@ fn main() {
                 }
                 Commands::Read { address, size } => {
                     println!("A: {address:#X}, S: {size}");
-                    let result = phase_read(&mut *serial);
+                    let result = phase_read(&mut *serial, *address, *size);
                     match result {
                         Ok(()) => {}
                         Err(error) => {
