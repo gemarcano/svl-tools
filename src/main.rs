@@ -110,7 +110,7 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
         }
     }
 
-    print!("Read complete: ");
+    print!("{size} bytes at address {address:#0X}:\n\t");
     for byte in &read_response {
         print!("{byte:#04X} ");
     }
@@ -127,7 +127,6 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
 fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<()> {
     info!("Phase: Bootload");
 
-    let start_time = Instant::now();
     // The frame size is determined by the size of the receive buffer on the device, which is 2048
     // currently
     let frame_size: usize = 512 * 4 * 4;
@@ -162,6 +161,7 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
 
     let mut bootloader_done = false;
 
+    let start_time = Instant::now();
     while !bootloader_done {
         let packet = serial.get_packet()?;
         match packet.command {
@@ -218,8 +218,8 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<(
         }
     }
 
-    println!("Upload complete");
     let bits_per_second = (total_length as f64) / (Instant::now() - start_time).as_secs_f64();
+    println!("Upload complete");
     println!("Nominal bootload bps: {}", bits_per_second);
 
     Ok(())
@@ -358,7 +358,6 @@ fn main() {
                     }
                 }
                 Commands::Read { address, size } => {
-                    println!("A: {address:#X}, S: {size}");
                     let result = phase_read(&mut *serial, *address, *size);
                     match result {
                         Ok(()) => {}
