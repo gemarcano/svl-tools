@@ -39,7 +39,7 @@ fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     // Send the baud detection character, it's 0b10101010
     serial.write_u8(b'U')?;
     let packet = serial.get_packet()?;
-    println!("Got SVL Bootloader Version: {}", packet.data[0]);
+    println!("Got SVL Bootloader Version: {:02X}", packet.data[0]);
 
     Ok(())
 }
