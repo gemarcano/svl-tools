@@ -28,7 +28,7 @@ use std::time;
 use std::time::Duration;
 use std::time::Instant;
 
-fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
+fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<u8> {
     info!("Phase: Setup");
 
     // Handle the serial startup blip
@@ -46,7 +46,7 @@ fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     let packet = serial.get_packet()?;
     println!("Got SVL Bootloader Version: {:02X}", packet.data[0]);
 
-    Ok(())
+    Ok(packet.data[0])
 }
 
 fn enter_bootload(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
@@ -129,12 +129,8 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
     Ok(())
 }
 
-fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path) -> Result<()> {
+fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path, frame_size: usize) -> Result<()> {
     info!("Phase: Bootload");
-
-    // The frame size is determined by the size of the receive buffer on the device, which is 2048
-    // currently
-    let frame_size: usize = 512 * 4 * 4;
 
     let resend_max = 4;
     let mut resend_count = 0;
@@ -333,9 +329,19 @@ fn main() {
         std::thread::sleep(time::Duration::from_millis(150));
 
         // Pre-check-- make sure the binfile exists, and that its size is reasonable
-        if phase_setup(&mut *serial).is_err() {
+        let version = phase_setup(&mut *serial);
+        let Ok(version) = version else {
             error!("Failed to setup connection");
-        }
+            continue;
+        };
+        // Decide on the device buffer size based on the version. For Sparkfun bootloaders, use
+        // 2048. For ours, use flash page size, or 8192. We have set the upper nibble for our
+        // versions
+        let frame_size = if (version >> 4) > 0 {
+            8192
+        } else {
+            2048
+        };
 
         // Send bootloader command and check for a NEXT reply...
         if enter_bootload(&mut *serial).is_ok() {
@@ -347,7 +353,7 @@ fn main() {
                         error!("Bin file {} does not exist.", binfile.display());
                         return;
                     }
-                    let result = phase_bootload(&mut *serial, binfile);
+                    let result = phase_bootload(&mut *serial, binfile, frame_size);
                     match result {
                         Ok(()) => break,
                         Err(error) => {
