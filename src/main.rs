@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2020 Ambiq Micro
+// SPDX-FileCopyrightText: 2023-2024 Gabriel Marcano
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
 mod svl;
 use svl::Command;
 use svl::Error;
