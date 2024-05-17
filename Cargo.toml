@@ -3,6 +3,12 @@ name = "svl-tools"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
+description = "Tools for interfacing with the Sparkfun Variable Bootloader (SVL)."
+authors = ["Gabriel Marcano"]
+repository = "https://github.com/gemarcano/svl-tools"
+keywords = ["Apollo3", "Artemis", "programmer", "bootloader"]
+categories = ["command-line-utilities"]
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
