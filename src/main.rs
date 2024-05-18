@@ -17,9 +17,9 @@ use log::{debug, error, info};
 use serialport::SerialPort;
 
 use std::cmp;
-use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::num;
 use std::path::Path;
 use std::path::PathBuf;
@@ -89,9 +89,9 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
         let packet = serial.get_packet()?;
         match packet.command {
             Command::Next | Command::Retry => {
-                if let Command::Retry = packet.command {
+                if matches!(packet.command, Command::Retry) {
                     if resend_count >= resend_max {
-                        return Err(Error::BootloadError("Too many retries...".to_string()));
+                        return Err(Error::Bootload("Too many retries...".to_string()));
                     }
                     resend_count += 1;
                     info!("Retrying...");
@@ -110,7 +110,7 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
                 read_done = true;
             }
             _ => {
-                return Err(Error::BootloadError("Timeout or unknown error".to_string()));
+                return Err(Error::Bootload("Timeout or unknown error".to_string()));
             }
         }
     }
@@ -129,28 +129,48 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
     Ok(())
 }
 
-fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path, frame_size: usize) -> Result<()> {
+fn phase_bootload(
+    serial: &mut (impl Svl + ?Sized),
+    bin_path: &Path,
+    frame_size: u16,
+) -> Result<()> {
     info!("Phase: Bootload");
 
     let resend_max = 4;
     let mut resend_count = 0;
 
-    let mut binary = File::open(bin_path)?;
-    let mut binary_data = vec![];
+    let binary = File::open(bin_path)?;
 
-    //FIXME should we first read the size of the data, and make a determination about whether it is
-    //OK to send?
-    let total_length = fs::metadata(bin_path)?.len() as usize;
-    // FIXME why not iterate on the data?
-    binary.read_to_end(&mut binary_data)?;
+    // Max allowable size is 0xF40000 bytes, or the difference between the load address and the
+    // rest of flash space. This is more than 16 bits, so we must represent the size as u32 at
+    // least
+    let total_length = binary.metadata()?.len();
+    if total_length > (0x0010_0000 - 0xC000) {
+        return Err(Error::Bootload("binary is too large".to_string()));
+    }
+    let total_length = u32::try_from(total_length).unwrap();
 
-    assert!(total_length == binary_data.len());
-    let total_frames = ((total_length as f64) / (frame_size as f64)).ceil() + 0.5;
-    let total_frames = total_frames as usize;
+    let mut reader = BufReader::with_capacity(frame_size.into(), binary);
 
-    let mut current_frame: usize = 0;
+    // There can be no more than 0x0010_0000 / 0x100 frames, or 0x100, which is fits in a u16
+    let total_frames = if total_length % u32::from(frame_size) != 0 {
+        total_length / u32::from(frame_size) + 1
+    } else {
+        total_length / u32::from(frame_size)
+    };
 
-    let progress_bar = ProgressBar::new(total_frames as u64);
+    let total_frames = u16::try_from(total_frames);
+
+    if total_frames.is_err() {
+        return Err(Error::Bootload(
+            "total number of frames exceed limits".to_string(),
+        ));
+    }
+    let total_frames = total_frames.unwrap();
+
+    let mut current_frame: u16 = 0;
+
+    let progress_bar = ProgressBar::new(total_frames.into());
     progress_bar
         .set_style(ProgressStyle::with_template("{bar:^20.red/white.bold} {percent:>3}%").unwrap());
     progress_bar.tick();
@@ -174,11 +194,11 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path, frame_size:
                 info!("Retrying...");
                 resend_count += 1;
                 if resend_count >= resend_max {
-                    return Err(Error::BootloadError("Too many retries...".to_string()));
+                    return Err(Error::Bootload("Too many retries...".to_string()));
                 }
             }
             _ => {
-                return Err(Error::BootloadError("Timeout or unknown error".to_string()));
+                return Err(Error::Bootload("Timeout or unknown error".to_string()));
             }
         }
 
@@ -187,29 +207,25 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path, frame_size:
             current_frame, resend_count
         );
         if current_frame <= total_frames {
-            // If we knew what our maximum physical limits were, we can guarantee conversions...
-            // Is this bootloader only used on the Apollo3 Sparkfun boards???
-            // If so, we can check that the binary fits in flash, so we can confirm that all of the
-            // conversions here are valid, at least for a 32-bit host platform...
-            // There's no way a 16 bit plaform can support loading in a large binary all at once,
-            // so just unwrap frame start and end
-            let frame_start = (current_frame - 1) * frame_size;
-            let frame_end = frame_start + cmp::min(frame_size, total_length - frame_start);
+            let frame_start = u32::from((current_frame - 1) * frame_size);
+            let frame_end: u32 =
+                frame_start + cmp::min(u32::from(frame_size), total_length - frame_start);
             debug!("frame start: {}, frame_end: {}", frame_start, frame_end);
-            let frame_data = &binary_data[frame_start..frame_end];
+            let buffer = reader.fill_buf()?;
+            let buffer_length = buffer.len();
 
             info!(
                 "Sending frame# {}, length: {}",
-                current_frame,
-                frame_data.len()
+                current_frame, buffer_length
             );
 
-            progress_bar.set_position(current_frame as u64);
+            progress_bar.set_position(u64::from(current_frame));
 
             serial.send_packet(&Packet {
                 command: Command::Frame,
-                data: frame_data.to_vec(),
+                data: buffer.to_vec(),
             })?;
+            reader.consume(buffer_length);
         } else {
             serial.send_packet(&Packet {
                 command: Command::Done,
@@ -219,9 +235,9 @@ fn phase_bootload(serial: &mut (impl Svl + ?Sized), bin_path: &Path, frame_size:
         }
     }
 
-    let bits_per_second = (total_length as f64) / (Instant::now() - start_time).as_secs_f64();
+    let bits_per_second = f64::from(total_length) / start_time.elapsed().as_secs_f64();
     println!("Upload complete");
-    println!("Nominal bootload bps: {}", bits_per_second);
+    println!("Nominal bootload bps: {bits_per_second}");
 
     Ok(())
 }
@@ -276,20 +292,20 @@ struct Cli {
 
 fn parse_duration(arg: &str) -> result::Result<Duration, num::ParseIntError> {
     let milliseconds = arg.parse()?;
-    Ok(std::time::Duration::from_millis(milliseconds))
+    Ok(Duration::from_millis(milliseconds))
 }
 
 fn parse_maybe_hex(arg: &str) -> result::Result<u32, num::ParseIntError> {
-    if let Some(s) = arg.strip_prefix("0x") {
-        u32::from_str_radix(s, 16)
+    if let Some(hex) = arg.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
     } else {
         arg.parse::<u32>()
     }
 }
 
 fn parse_maybe_hex16(arg: &str) -> result::Result<u16, num::ParseIntError> {
-    if let Some(s) = arg.strip_prefix("0x") {
-        u16::from_str_radix(s, 16)
+    if let Some(hex) = arg.strip_prefix("0x") {
+        u16::from_str_radix(hex, 16)
     } else {
         arg.parse::<u16>()
     }
@@ -311,10 +327,9 @@ fn main() {
 
     // FIXME what about tty?
 
-    const NUM_TRIES: i32 = 3;
-
     let mut entered_bootloader = false;
 
+    const NUM_TRIES: i32 = 3;
     for _ in 0..NUM_TRIES {
         let serial = serialport::new(cli.port.to_string_lossy(), cli.baud)
             .timeout(cli.timeout)
@@ -337,11 +352,7 @@ fn main() {
         // Decide on the device buffer size based on the version. For Sparkfun bootloaders, use
         // 2048. For ours, use flash page size, or 8192. We have set the upper nibble for our
         // versions
-        let frame_size = if (version >> 4) > 0 {
-            8192
-        } else {
-            2048
-        };
+        let frame_size = if (version >> 4) > 0 { 8192 } else { 2048 };
 
         // Send bootloader command and check for a NEXT reply...
         if enter_bootload(&mut *serial).is_ok() {
@@ -358,12 +369,12 @@ fn main() {
                         Ok(()) => break,
                         Err(error) => {
                             match error {
-                                Error::InvalidPacket(error) => println!("{}", error),
-                                Error::BootloadError(error) => println!("{}", error),
-                                Error::Io(error) => println!("{}", error),
-                                Error::Serial(error) => println!("{}", error),
+                                Error::InvalidPacket(error) => error!("{error}"),
+                                Error::Bootload(error) => error!("{error}"),
+                                Error::Io(error) => error!("{error}"),
+                                Error::Serial(error) => error!("{error}"),
                             }
-                            println!("Upload failed");
+                            error!("Upload failed");
                             continue;
                         }
                     }
@@ -374,12 +385,12 @@ fn main() {
                         Ok(()) => {}
                         Err(error) => {
                             match error {
-                                Error::InvalidPacket(error) => println!("{}", error),
-                                Error::BootloadError(error) => println!("{}", error),
-                                Error::Io(error) => println!("{}", error),
-                                Error::Serial(error) => println!("{}", error),
+                                Error::InvalidPacket(error) => error!("{error}"),
+                                Error::Bootload(error) => error!("{error}"),
+                                Error::Io(error) => error!("{error}"),
+                                Error::Serial(error) => error!("{error}"),
                             }
-                            println!("Read failed");
+                            error!("Read failed");
                             continue;
                         }
                     }
@@ -387,11 +398,10 @@ fn main() {
             }
             // If we got here, we didn't hit an error, so break out...
             break;
-        } else {
-            error!("Failed to enter bootload phase");
         }
+        error!("Failed to enter bootload phase");
     }
     if !entered_bootloader {
-        println!("Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader.");
+        error!("Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader.");
     }
 }

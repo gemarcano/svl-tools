@@ -20,18 +20,18 @@ pub(crate) enum Error {
     Serial(serialport::Error),
     Io(io::Error),
     InvalidPacket(String),
-    BootloadError(String),
+    Bootload(String),
 }
 
 impl From<serialport::Error> for Error {
-    fn from(err: serialport::Error) -> Error {
-        Error::Serial(err)
+    fn from(err: serialport::Error) -> Self {
+        Self::Serial(err)
     }
 }
 
 impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Error {
-        Error::Io(err)
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
     }
 }
 
@@ -49,7 +49,7 @@ pub(crate) enum Command {
 
 impl From<Command> for u8 {
     fn from(command: Command) -> Self {
-        command as u8
+        command as Self
     }
 }
 
@@ -57,14 +57,14 @@ impl TryFrom<u8> for Command {
     type Error = Error;
     fn try_from(num: u8) -> result::Result<Self, Self::Error> {
         match num {
-            1 => Ok(Command::Version),
-            2 => Ok(Command::Bootload),
-            3 => Ok(Command::Next),
-            4 => Ok(Command::Frame),
-            5 => Ok(Command::Retry),
-            6 => Ok(Command::Done),
-            100 => Ok(Command::Read),
-            101 => Ok(Command::ReadResponse),
+            1 => Ok(Self::Version),
+            2 => Ok(Self::Bootload),
+            3 => Ok(Self::Next),
+            4 => Ok(Self::Frame),
+            5 => Ok(Self::Retry),
+            6 => Ok(Self::Done),
+            100 => Ok(Self::Read),
+            101 => Ok(Self::ReadResponse),
             _ => Err(Error::InvalidPacket("Unknown command".to_string())),
         }
     }
@@ -122,7 +122,7 @@ pub(crate) trait Svl: ReadBytesExt + WriteBytesExt {
             return Err(Error::InvalidPacket("Too much data in packet".to_string()));
         }
 
-        let len: u16 = (packet.data.len() + 3) as u16;
+        let len: u16 = u16::try_from(packet.data.len() + 3).unwrap();
         let cmd: u8 = packet.command.into();
         let crc = Crc::<u16>::new(&CRC_16_UMTS);
         let mut digest = crc.digest();
