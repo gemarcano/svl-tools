@@ -3,6 +3,10 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
+//! SVL bootloader access routines.
+//!
+//! The
+
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
@@ -14,9 +18,10 @@ use std::io;
 
 use std::result;
 
-pub(crate) type Result<T> = result::Result<T, Error>;
+pub type Result<T> = result::Result<T, Error>;
 
-pub(crate) enum Error {
+/// Errors that can be emitted by the bootloader and related functions.
+pub enum Error {
     Serial(serialport::Error),
     Io(io::Error),
     InvalidPacket(String),
@@ -35,15 +40,56 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Commands supported by the (augmented) SVL bootloader
+/// Commands with a value less than 100 are supported by the original SVL bootloader. Those
+/// commands with a value of 100 or above are supported by our augmented SVL bootloader.
 #[derive(Copy, Clone)]
-pub(crate) enum Command {
+pub enum Command {
+    /// When being sent, this command requests the version of the SVL bootloader. It has no
+    /// payload.
+    ///
+    /// When being received, this command contains the version of the SVL bootloader as a single
+    /// byte in the payload.
     Version = 1,
+    /// When being sent, this command requests the SVL bootloader to enter bootloader mode, and to
+    /// be ready to accept other bootloader commands. It has no payload.
+    ///
+    /// The bootloader does not send this command back.
     Bootload,
+    /// We do not send this command to the bootloader.
+    ///
+    /// When being received, this indicates that the bootloader is ready to receive another
+    /// command. It has no payload.
     Next,
+    /// When being sent, this command contains data to be flashed to the next frame on the device.
+    /// This contains up to the frame size of data in the payload to be flashed (2048 bytes on the
+    /// original SVL bootloader, 8192 bytes or the flash page size on the augmented SVL
+    /// bootloader).
+    ///
+    /// The bootloader does not send this command back.
     Frame,
+    /// We do not send this command to the bootloader.
+    ///
+    /// When being received, this indicates that something happened and the bootloader was unable
+    /// to execute the previous command, and it is asking for it to be repeated. There is no
+    /// payload.
     Retry,
+    /// When being sent, this command informs the bootloader to jump to the application code. It
+    /// has no payload.
+    ///
+    /// The bootloader does not send this command back.
     Done,
+    /// When being sent, this command requests a number of bytes to be read from a given address.
+    /// The payload consists of two 32-bit unsigned integers in network byte order. The first
+    /// unsigned integer is the address to read from, and the second is the number of bytes to read
+    /// from that address.
+    ///
+    /// The bootloader does not send this command back.
     Read = 100,
+    /// We do not send this command to the bootloader.
+    ///
+    /// When being received, this contains the data requested in the previous Read command. The
+    /// payload should contain the number of bytes requested in the previous Read command.
     ReadResponse,
 }
 
@@ -72,21 +118,30 @@ impl TryFrom<u8> for Command {
 
 // SVL uses CRC16 UMTS
 
-pub(crate) struct Packet {
+/// Represents a packet of bootloader data.
+pub struct Packet {
+    /// The command associated with the packet.
     pub command: Command,
+    /// An optional payload, its meaning depends on the command.
     pub data: Vec<u8>,
 }
 
-pub(crate) trait Svl: ReadBytesExt + WriteBytesExt {
+/// A trait for sending and receiving data from the SVL bootloader.
+///
+/// A raw packet consists of the following:
+///  - 2 bytes as length (big endian)
+///  - 1 byte as command
+///  - [0 - N] bytes as payload
+///  - 2 bytes as CRC (big endian)
+///
+/// The length specifies how many bytes there are in the rest of the packet, including CRC.
+///
+/// The CRC algorithm used is CRC16 UMTS.
+///
+/// The minimum packet size is 3, as length bytes don't count towards packet size.
+pub trait Svl: ReadBytesExt + WriteBytesExt {
+    /// Gets a packet from the bootloader.
     fn get_packet(&mut self) -> Result<Packet> {
-        // Packet consists of:
-        // 2 bytes as length (big endian)
-        // 1 byte as command
-        // [0 - N] bytes as payload
-        // 2 bytes as CRC (big endian)
-        //
-        // Minimum packet size is 3, as length bytes don't count towards packet size.
-
         let len = self.read_u16::<BigEndian>()?;
         debug!("Received a packet len: {}", len);
         if len < 3 {
@@ -117,6 +172,7 @@ pub(crate) trait Svl: ReadBytesExt + WriteBytesExt {
         Ok(result)
     }
 
+    /// Sends a packet to the bootloader.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if packet.data.len() > (u16::MAX - 3).into() {
             return Err(Error::InvalidPacket("Too much data in packet".to_string()));

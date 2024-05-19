@@ -3,6 +3,14 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
+//! # svl-tools
+//!
+//! This CLI provides tools for interfacing with Sparkfun Variable Loader found on Sparkfun's
+//! Artemis modules. This tool is derived from Sparkfun's svl.py implementation, and extended with
+//! a few extra commands.
+//!
+//! Commands supported: flash, read
+
 mod svl;
 use svl::Command;
 use svl::Error;
@@ -282,8 +290,10 @@ struct Cli {
     /// The baud rate to connect to the bootloader with.
     baud: u32,
     #[command(subcommand)]
+    /// The task to perform.
     command: Commands,
     #[command(flatten)]
+    /// The level of output verbosity.
     verbose: clap_verbosity_flag::Verbosity,
     #[arg(short, long, value_parser=parse_duration, default_value="500")]
     /// Serial communication timeout in milliseconds.
@@ -325,10 +335,9 @@ fn main() {
         env!("CARGO_PKG_VERSION_MINOR")
     );
 
-    // FIXME what about tty?
-
     let mut entered_bootloader = false;
 
+    // The number of tries to try to perform the requested task...
     const NUM_TRIES: i32 = 3;
     for _ in 0..NUM_TRIES {
         let serial = serialport::new(cli.port.to_string_lossy(), cli.baud)
