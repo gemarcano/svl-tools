@@ -3,13 +3,10 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! # svl-tools
-//!
-//! This CLI provides tools for interfacing with Sparkfun Variable Loader found on Sparkfun's
-//! Artemis modules. This tool is derived from Sparkfun's svl.py implementation, and extended with
-//! a few extra commands.
-//!
-//! Commands supported: flash, read
+//! This crate implements a CLI for interfacing with Sparkfun Variable Loader found on Sparkfun's
+//! Artemis modules. This tool is derived from Sparkfun's
+//! [svl.py](https://github.com/sparkfun/Apollo3_Uploader_SVL) implementation, and extended with a
+//! few extra commands.
 
 mod svl;
 use svl::Command;
@@ -36,6 +33,17 @@ use std::time;
 use std::time::Duration;
 use std::time::Instant;
 
+/// Prepares the serial interface for the start of communication with the bootloader, and returns
+/// the bootloader version on success.
+///
+/// This clears the serial RX buffer, then sends an alternating bit pattern to the bootloader for
+/// auto-baud detection, and then listens for a [Command::Version] packet.
+///
+/// # Errors
+///
+/// [Error::Serial], [Error::Io]. In essence, any error that can be returned by the serial device,
+/// and possibly a timeout if the bootloader does not reply within the serial port's configued
+/// timeout window.
 fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<u8> {
     info!("Phase: Setup");
 
@@ -52,11 +60,20 @@ fn phase_setup(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<u8> {
     // Send the baud detection character, it's 0b10101010
     serial.write_u8(b'U')?;
     let packet = serial.get_packet()?;
-    println!("Got SVL Bootloader Version: {:02X}", packet.data[0]);
+    info!("Got SVL Bootloader Version: {:02X}", packet.data[0]);
 
     Ok(packet.data[0])
 }
 
+/// Informs the bootloader to enter its main command processing loop.
+///
+/// This sends the [Command::Bootload] packet to the bootloader, requesting that it begin waiting
+/// for other [Command] packets.
+///
+/// # Errors
+///
+/// [Error::Serial], [Error::Io]. In essence, any error that can be returned by the serial device
+/// while sending data.
 fn enter_bootload(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     info!("Sending 'enter bootloader' command");
 
@@ -68,6 +85,15 @@ fn enter_bootload(serial: &mut (impl SerialPort + Svl + ?Sized)) -> Result<()> {
     Ok(())
 }
 
+/// Requests that the bootloader respond with the contents of memory.
+///
+/// This sends the [Command::Read] packet to the bootloader, requesting that it read the memory
+/// starting at the given address, and return the given number of data bytes.
+///
+/// # Errors
+///
+/// [Error::Serial], [Error::Io]. In essence, any error that can be returned by the serial device
+/// while sending data.
 fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Result<()> {
     info!("Sending 'read' command");
 
@@ -82,6 +108,24 @@ fn request_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Re
     Ok(())
 }
 
+/// Handles the CLI read subcommand.
+///
+/// This runs the command loop for the read subcommand. It waits until the bootloader returns a
+/// [Command::Next] or [Command::Retry] packet (the latter happens if the bootloader did not
+/// understand the previous command), and then sends the [Command::Read] packet with the requested
+/// address and size. It then waits for a [Command::ReadResponse] packet from the bootloader, and
+/// prints the contents received from the bootloader. expects to receive a [Command::ReadResponse]
+/// packet from the bootloader. Afterwards, this sends a [Command::Done] packet to the bootloader
+/// to tell it to jump to the application at address 0x10000.
+///
+/// # Errors
+///
+/// [Error::Serial], [Error::Io]. In essence, any error that can be returned by the serial device
+/// while sending data.
+/// [Error::Bootload] if we exceed 4 retries in trying to send data to the bootloader, or if we
+/// received an unknown or unexpected [Command] from the bootloader.
+/// [Error::InvalidPacket] if the number of bytes in the payload does not match the number
+/// requested.
 fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Result<()> {
     info!("Phase: Read");
 
@@ -109,7 +153,7 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
                 }
             }
             Command::ReadResponse => {
-                if packet.data.len() < 4 && (packet.data.len() % 4) != 0 {
+                if packet.data.len() != size.into() {
                     return Err(Error::InvalidPacket(
                         "Wrong number of bytes in payload".to_string(),
                     ));
@@ -137,6 +181,20 @@ fn phase_read(serial: &mut (impl Svl + ?Sized), address: u32, size: u16) -> Resu
     Ok(())
 }
 
+/// Handles the CLI flash subcommand.
+/// This runs the command loop for the flash subcommand. Until all frames are sent, it waits until
+/// the bootloader returns a [Command::Next] or [Command::Retry] packet (the latter happens if the
+/// bootloader did not understand the previous command), and then sends the [Command::Frame] packet
+/// with the frame contents to be flashed. This repeats until an error occurs or all frame data is
+/// transferred.
+///
+/// # Errors
+///
+/// [Error::Serial], [Error::Io]. In essence, any error that can be returned by the serial device
+/// while sending data.
+/// [Error::Bootload] if the binary to be transferred is too big or the maximum number of possible
+/// frames is exceeded, if an unknown or unexpected [Command]  is received from the bootloader, or
+/// if too many retries have been attempted.
 fn phase_bootload(
     serial: &mut (impl Svl + ?Sized),
     bin_path: &Path,
@@ -245,17 +303,15 @@ fn phase_bootload(
 
     let bits_per_second = f64::from(total_length) / start_time.elapsed().as_secs_f64();
     println!("Upload complete");
-    println!("Nominal bootload bps: {bits_per_second}");
+    info!("Nominal bootload bps: {bits_per_second}");
 
     Ok(())
 }
 
-fn parse_baud(arg: String) -> u32 {
-    arg.parse::<u32>().unwrap()
-}
-
+/// Supported baud rates by the bootloader.
 const BAUD_OPTIONS: [&str; 5] = ["921600", "460800", "230400", "115200", "57600"];
 
+/// Command line interface subcommands
 #[derive(Subcommand)]
 enum Commands {
     /// Flash an application through the SVL.
@@ -275,6 +331,7 @@ enum Commands {
     },
 }
 
+/// Command line interface argument structure.
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
 #[command(propagate_version = true)]
@@ -319,6 +376,10 @@ fn parse_maybe_hex16(arg: &str) -> result::Result<u16, num::ParseIntError> {
     } else {
         arg.parse::<u16>()
     }
+}
+
+fn parse_baud(arg: String) -> u32 {
+    arg.parse::<u32>().unwrap()
 }
 
 fn main() {

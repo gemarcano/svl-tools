@@ -4,8 +4,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! SVL bootloader access routines.
-//!
-//! The
 
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
@@ -116,8 +114,6 @@ impl TryFrom<u8> for Command {
     }
 }
 
-// SVL uses CRC16 UMTS
-
 /// Represents a packet of bootloader data.
 pub struct Packet {
     /// The command associated with the packet.
@@ -126,7 +122,7 @@ pub struct Packet {
     pub data: Vec<u8>,
 }
 
-/// A trait for sending and receiving data from the SVL bootloader.
+/// A trait for sending to and receiving data from the SVL bootloader.
 ///
 /// A raw packet consists of the following:
 ///  - 2 bytes as length (big endian)
@@ -139,8 +135,15 @@ pub struct Packet {
 /// The CRC algorithm used is CRC16 UMTS.
 ///
 /// The minimum packet size is 3, as length bytes don't count towards packet size.
+///
+/// All data is encoded in network byte order.
 pub trait Svl: ReadBytesExt + WriteBytesExt {
     /// Gets a packet from the bootloader.
+    ///
+    /// # Errors
+    ///
+    /// [Error::InvalidPacket] If the CRC received doesn't match the data, or if the packet length
+    /// is less than three.
     fn get_packet(&mut self) -> Result<Packet> {
         let len = self.read_u16::<BigEndian>()?;
         debug!("Received a packet len: {}", len);
@@ -173,6 +176,9 @@ pub trait Svl: ReadBytesExt + WriteBytesExt {
     }
 
     /// Sends a packet to the bootloader.
+    ///
+    /// # Errors
+    /// [Error::InvalidPacket] if the payload length is larger than what the length field supports.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if packet.data.len() > (u16::MAX - 3).into() {
             return Err(Error::InvalidPacket("Too much data in packet".to_string()));
