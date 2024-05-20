@@ -8,12 +8,11 @@
 //! [svl.py](https://github.com/sparkfun/Apollo3_Uploader_SVL) implementation, and extended with a
 //! few extra commands.
 
-mod svl;
-use svl::Command;
-use svl::Error;
-use svl::Packet;
-use svl::Result;
-use svl::Svl;
+use svl_tools::Command;
+use svl_tools::Error;
+use svl_tools::Packet;
+use svl_tools::Result;
+use svl_tools::Svl;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
