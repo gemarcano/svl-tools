@@ -9,7 +9,7 @@ use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 
-use crc::{Crc, CRC_16_UMTS};
+use crc::{CRC_16_UMTS, Crc};
 use log::debug;
 
 use std::io;

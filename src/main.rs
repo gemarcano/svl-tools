@@ -471,6 +471,8 @@ fn main() {
         error!("Failed to enter bootload phase");
     }
     if !entered_bootloader {
-        error!("Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader.");
+        error!(
+            "Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader."
+        );
     }
 }
